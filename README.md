@@ -127,3 +127,7 @@ npm test
 Tests use an isolated HTTP fixture for OAuth redirects and API writes. They verify production URL defaults, missing-credential behavior, callback validation, CSRF, server-only tokens, company binding, granted permissions and recovery after lost responses. CI runs on Node 22 and 24. The fixture is never started by the app.
 
 For integration help, contact **support@fiz.co** with your application ID, endpoint, UTC time, status and request ID. Never send secrets, tokens or AT credentials.
+
+## License
+
+[MIT](LICENSE) © 2026 FIZ.

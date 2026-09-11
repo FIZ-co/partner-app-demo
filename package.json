@@ -2,6 +2,7 @@
   "name": "fiz-partner-app-demo",
   "version": "1.0.0",
   "private": true,
+  "license": "MIT",
   "description": "An order-management partner app connecting directly to production FIZ for signup, OAuth and invoice drafts.",
   "type": "module",
   "engines": {
