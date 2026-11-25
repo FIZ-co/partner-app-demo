@@ -25,19 +25,20 @@ async function setup(
     shortToken = false,
     companyError,
     companyId = "company-a",
+    accessToken = "synthetic-access",
     scope = config.scopes,
     lostDraft = false,
     draftConflict,
   } = {},
 ) {
   const calls = [];
-  const server = createDemoServer(config, async (url, init) => {
-    calls.push({ url: url.href, ...init });
+  const server = createDemoServer(config, async (input, init) => {
+    const url = new URL(input);
+    calls.push({ url: url.href, ...init, headers: new Headers(init.headers) });
     if (url.pathname === "/oauth/token") {
-      if (
-        new URLSearchParams(init.body).get("grant_type") === "refresh_token" &&
-        refreshError
-      ) {
+      const refreshing =
+        new URLSearchParams(init.body).get("grant_type") === "refresh_token";
+      if (refreshing && refreshError) {
         const error = refreshError;
         refreshError = undefined;
         if (error === "transport") throw new Error("Synthetic response lost");
@@ -46,7 +47,7 @@ async function setup(
       const expires = shortToken ? 0 : 3600;
       shortToken = false;
       return Response.json({
-        access_token: "synthetic-access",
+        access_token: refreshing ? "refreshed-access" : accessToken,
         refresh_token: "synthetic-refresh",
         expires_in: expires,
         scope,
@@ -191,10 +192,23 @@ test("real HTTP callback, company readiness and explicit draft POST keep tokens 
   const drafts = calls.filter((call) => call.url.endsWith("/invoices"));
   assert.equal(drafts.length, 2);
   assert.equal(
-    drafts[0].headers["Idempotency-Key"],
-    drafts[1].headers["Idempotency-Key"],
+    drafts[0].headers.get("idempotency-key"),
+    drafts[1].headers.get("idempotency-key"),
   );
-  assert.equal(drafts[0].headers.Authorization, "Bearer synthetic-access");
+  const draftKey = drafts[0].headers.get("idempotency-key");
+  assert.match(draftKey, /^order-1042:[a-f0-9]{32}:draft$/);
+  const apiCalls = calls.filter((call) => new URL(call.url).origin === config.api);
+  for (const call of apiCalls) {
+    assert.equal(call.headers.get("authorization"), "Bearer synthetic-access");
+    assert.equal(call.headers.has("x-api-key"), false);
+  }
+  for (const [path, step] of [["/customers", "customer"], ["/items", "item"]]) {
+    const call = calls.find((call) => call.url.endsWith(path));
+    assert.equal(
+      call.headers.get("idempotency-key"),
+      draftKey.replace(/draft$/, step),
+    );
+  }
   assert.deepEqual(JSON.parse(drafts[0].body), {
     type: "INVOICE",
     cae: "62010",
@@ -219,6 +233,13 @@ test("real HTTP callback, company readiness and explicit draft POST keep tokens 
   );
 });
 
+test("a blank OAuth token cannot open an SDK connection", async (t) => {
+  const { calls, request, connect } = await setup(t, { accessToken: " " });
+  assert.match(await (await connect()).text(), /Invalid token response/);
+  assert.equal((await request("/company")).status, 400);
+  assert.equal(calls.length, 1);
+});
+
 test("temporary unavailability keeps refresh credentials for a later explicit retry", async (t) => {
   const { calls, request, connect } = await setup(t, {
     shortToken: true,
@@ -227,6 +248,8 @@ test("temporary unavailability keeps refresh credentials for a later explicit re
   await connect();
   assert.equal((await request("/company")).status, 400);
   assert.equal((await request("/company")).status, 200);
+  const company = calls.find((call) => call.url.endsWith("/company"));
+  assert.equal(company.headers.get("authorization"), "Bearer refreshed-access");
   const refreshes = calls.filter(
     (call) =>
       call.url.endsWith("/oauth/token") &&
@@ -358,8 +381,8 @@ test("lost draft response keeps the order retryable with the original key and in
   const drafts = calls.filter((call) => call.url.endsWith("/invoices"));
   assert.equal(drafts.length, 2);
   assert.equal(
-    drafts[0].headers["Idempotency-Key"],
-    drafts[1].headers["Idempotency-Key"],
+    drafts[0].headers.get("idempotency-key"),
+    drafts[1].headers.get("idempotency-key"),
   );
   assert.equal(drafts[0].body, drafts[1].body);
   assert.equal(
