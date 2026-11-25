@@ -1,12 +1,12 @@
 import { randomBytes } from "node:crypto";
 import { createServer } from "node:http";
+import { Fiz, FizApiError, FizConflictError } from "@fiz-co/sdk";
 
 import {
   createAuthorization,
   createSignupUrl,
   validateCallback,
 } from "./oauth.mjs";
-import { apiRequest, createDraft } from "./rest.mjs";
 import { dashboard, shell, setupPage } from "./views.mjs";
 import { order, draftPath } from "./order.mjs";
 
@@ -37,7 +37,10 @@ export function createDemoServer(config, fetchImpl = fetch) {
       );
     }
     const tokens = await response.json();
-    if (!tokens.access_token || !tokens.refresh_token)
+    const validTokens = [tokens?.access_token, tokens?.refresh_token].every(
+      (token) => typeof token === "string" && token.trim().length > 0,
+    );
+    if (!validTokens)
       throw new Error("Invalid token response.");
     return { ...tokens, expiresAt: Date.now() + tokens.expires_in * 1000 };
   }
@@ -72,6 +75,16 @@ export function createDemoServer(config, fetchImpl = fetch) {
     return session.refresh;
   }
 
+  async function clientFor(session) {
+    return new Fiz({
+      accessToken: await accessToken(session),
+      baseUrl: config.api,
+      fetch: fetchImpl,
+      timeout: 15_000,
+      maxRetries: 0, // The user retries the order with its original keys.
+    });
+  }
+
   function render(res, session, message = "", status = 200, page) {
     res.writeHead(status, {
       "Content-Type": "text/html; charset=utf-8",
@@ -86,6 +99,7 @@ export function createDemoServer(config, fetchImpl = fetch) {
 
   const server = createServer(async (req, res) => {
     let session = { csrf: "" };
+    let writePath;
     try {
       if (
         req.method !== "GET" &&
@@ -216,18 +230,18 @@ export function createDemoServer(config, fetchImpl = fetch) {
           throw new Error(
             "A write is already in progress. Wait, then retry the same request.",
           );
-        if (session.orderUncertain)
+        if (session.uncertainWritePath)
           throw new Error(
-            "Check the existing FIZ records before starting another operation. The previous result is unknown; contact support if needed.",
+            `The outcome of POST ${session.uncertainWritePath} is unknown. Check the record in FIZ before resetting this order.`,
           );
         session.writing = true;
         try {
-          const token = await accessToken(session);
+          const fiz = await clientFor(session);
           if (!session.tokens.scope?.split(" ").includes("invoicing.write"))
             throw new Error(
               "Permission to create drafts was not granted. Reconnect and allow draft creation.",
             );
-          let key = `order-${order.number}:${session.requestId}`;
+          const key = `order-${order.number}:${session.requestId}`;
           const input = {
             cae: form.get("cae"),
             vatRate: form.get("vatRate"),
@@ -254,33 +268,20 @@ export function createDemoServer(config, fetchImpl = fetch) {
             );
           session.orderInput = input;
           // Persist every successful step. Stable keys also cover a lost HTTP response.
-          session.orderCustomer ??= await apiRequest(
-            config,
-            token,
-            "/customers",
+          writePath = "/customers";
+          session.orderCustomer ??= await fiz.customers.create(order.customer, {
+            idempotencyKey: `${key}:customer`,
+          });
+          writePath = "/items";
+          session.orderItem ??= await fiz.items.create(
             {
-              method: "POST",
-              requestId: `${key}:customer`,
-              payload: order.customer,
+              ...order.item,
+              vatRate: input.vatRate,
+              ...(input.vatExemptionReason && {
+                vatExemptionReason: input.vatExemptionReason,
+              }),
             },
-            fetchImpl,
-          );
-          session.orderItem ??= await apiRequest(
-            config,
-            token,
-            "/items",
-            {
-              method: "POST",
-              requestId: `${key}:item`,
-              payload: {
-                ...order.item,
-                vatRate: input.vatRate,
-                ...(input.vatExemptionReason && {
-                  vatExemptionReason: input.vatExemptionReason,
-                }),
-              },
-            },
-            fetchImpl,
+            { idempotencyKey: `${key}:item` },
           );
           if (!session.orderCustomer.id || !session.orderItem.id)
             throw new Error(
@@ -292,16 +293,10 @@ export function createDemoServer(config, fetchImpl = fetch) {
             customerId: session.orderCustomer.id,
             items: [{ id: session.orderItem.id, quantity: order.quantity }],
           };
-          key += ":draft";
-          // This action only creates an INVOICE draft. There is no fiscal issuance endpoint.
-          session.lastRequest = { payload, key };
-          const result = await createDraft(
-            config,
-            token,
-            payload,
-            key,
-            fetchImpl,
-          );
+          writePath = "/invoices";
+          const result = await fiz.invoices.create(payload, {
+            idempotencyKey: `${key}:draft`,
+          });
           if (!result.id)
             throw new Error(
               "FIZ did not return a draft ID. Retry this same order to recover the result.",
@@ -313,24 +308,19 @@ export function createDemoServer(config, fetchImpl = fetch) {
             `Order #${order.number} saved as a draft in FIZ.`,
           );
         } catch (error) {
-          if (error.requiresReconciliation) session.orderUncertain = true;
+          if (
+            error instanceof FizConflictError &&
+            !error.headers.get("retry-after")
+          )
+            session.uncertainWritePath = writePath;
           throw error;
         } finally {
           session.writing = false;
         }
       }
       if (url.pathname === "/company") {
-        const token = await accessToken(session);
-        const response = await fetchImpl(new URL("/company", config.api), {
-          headers: { Authorization: `Bearer ${token}` },
-          redirect: "error",
-          signal: AbortSignal.timeout(15_000),
-        });
-        if (!response.ok)
-          throw new Error(
-            `Company request returned HTTP ${response.status}. Reconnect or check the company plan.`,
-          );
-        const company = await response.json();
+        const fiz = await clientFor(session);
+        const company = await fiz.company.retrieve();
         // A real marketplace must compare this issuer with its expected company.
         if (session.tenantId && company.id !== session.tenantId)
           throw new Error("Unexpected issuer. Confirm the selected company.");
@@ -345,7 +335,9 @@ export function createDemoServer(config, fetchImpl = fetch) {
         return render(res, session, "Page not found", 404);
       render(res, session);
     } catch (error) {
-      render(res, session ?? { csrf: "" }, error.message, 400);
+      const message =
+        error instanceof FizApiError ? apiErrorHint(error, writePath) : error.message;
+      render(res, session ?? { csrf: "" }, message, 400);
     }
   });
   const sweep = setInterval(() => {
@@ -355,4 +347,21 @@ export function createDemoServer(config, fetchImpl = fetch) {
   sweep.unref();
   server.on("close", () => clearInterval(sweep));
   return server;
+}
+
+function apiErrorHint(error, writePath) {
+  const retry = error.headers.get("retry-after");
+  const hints = {
+    401: "Check expiry, app availability and the token resource. Reconnect if the grant was revoked.",
+    403: "Check the granted scopes, company membership and API entitlement.",
+    409: retry
+      ? "The request is still running. Wait, then retry this same order with its existing key."
+      : "The earlier request may have taken effect. Check the result in FIZ before starting another operation.",
+    422: "This key was used with another payload. Keep the original payload for a retry.",
+    429: "Wait before trying again.",
+  };
+  const hint =
+    hints[error.status] ?? "Check the request against the API reference.";
+  const operation = writePath ? `POST ${writePath}` : "FIZ";
+  return `${operation} returned HTTP ${error.status}. ${hint}${retry ? ` Retry-After: ${retry}.` : ""}`;
 }

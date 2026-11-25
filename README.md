@@ -37,11 +37,12 @@ Copy the **application ID** (24-character registry ID), **client ID** (`fiz_app_
 
 ## 2. Configure and run your app
 
-Install **Node.js 22.17+** and Git. No package dependencies are needed.
+Install **Node.js 22.17+** and Git.
 
 ```sh
 git clone https://github.com/FIZ-co/partner-app-demo.git
 cd partner-app-demo
+npm ci
 cp .env.example .env
 ```
 
@@ -85,13 +86,14 @@ A Production application is a separate registration with public HTTPS URLs and F
 | `order.mjs`     | Your product’s example order, customer and service; replace with your own database |
 | `views.mjs`     | Partner app screens: order, FIZ connection, draft result and developer setup       |
 | `oauth.mjs`     | PKCE S256, state, issuer/callback validation and signup link                       |
-| `app.mjs`       | Server sessions, token exchange/refresh, company binding and order-to-draft action |
-| `rest.mjs`      | Bearer requests, timeouts, idempotency keys and API error hints                    |
+| `app.mjs`       | Server sessions, token exchange/refresh, SDK client, company binding and order-to-draft action |
 | `config.mjs`    | Product name, production FIZ defaults and credential validation                    |
 | `server.mjs`    | Local app startup; no fake FIZ server                                              |
 | `test-support/` | Synthetic OAuth/API fixture used only by automated tests                           |
 
-An order calls `POST /customers`, `POST /items`, then `POST /invoices`. The returned item ID belongs in **`items[].id`**. Customer and item IDs are cached after each successful step. Draft creation is blocked until `GET /company` verifies the connection and the granted scope includes `invoicing.write`.
+The app exchanges and refreshes OAuth tokens on the server. It passes the current session’s access token to the [official JavaScript SDK](https://github.com/FIZ-co/fiz-sdk-js). Before accepting a draft, the app verifies the company with `fiz.company.retrieve()` and checks the granted `invoicing.write` scope.
+
+An order calls `fiz.customers.create()`, `fiz.items.create()`, then `fiz.invoices.create()`. The returned item ID belongs in **`items[].id`**. Customer and item IDs are cached after each successful step. The SDK uses a 15-second timeout and `maxRetries: 0` so the user controls when to retry.
 
 Each step retains a stable `Idempotency-Key` for the order. After a lost write response, retry the same action to discover the recorded outcome. A completed result can replay for 30 days. While the 90-second execution lease is active, a 409 with `Retry-After` asks you to retry the same key later. An expired lease without a reported result, or a failure after execution may have started, produces an abandoned/unknown outcome: stop retries and reconcile first. The app preserves the original inputs and rejects changed settings once creation has started. It never automatically issues a fiscal document.
 
