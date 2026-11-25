@@ -56,8 +56,15 @@ export function dashboard(config, session, message = "", failed = false) {
   let invoice;
   if (saved) {
     invoice = `<div class="invoice-status"><span class="status-icon saved">${icon("check")}</span><div><h3>Draft saved in FIZ</h3><span class="small muted">${h(company.name || "Your company")} · Not issued</span></div></div><span class="draft-id">Document ID: ${h(saved.id)}</span><p class="hint">The order’s customer, service and draft are saved in your FIZ company. Review the draft in FIZ when you’re ready.</p><div class="actions"><a class="button secondary" href="${h(new URL("/invoices", config.appUrl).href)}" target="_blank" rel="noreferrer">Open FIZ ${icon("arrow")}</a></div>`;
-  } else if (session.orderUncertain) {
-    invoice = `<div class="invoice-status"><span class="status-icon">${icon("orders")}</span><div><h3>Check the result in FIZ</h3><span class="small muted">The earlier request may have been saved.</span></div></div><p class="hint">Automatic retries are stopped. Check the company’s existing records before trying again. If the outcome is unclear, contact support to avoid creating a duplicate.</p><div class="actions"><a class="button secondary" href="${h(new URL("/invoices", config.appUrl).href)}" target="_blank" rel="noreferrer">Open FIZ ${icon("arrow")}</a></div>`;
+  } else if (session.uncertainWritePath) {
+    const path = session.uncertainWritePath;
+    const records = {
+      "/customers": { record: `customer “${order.customer.name}”`, link: "Check customers" },
+      "/items": { record: `service item “${order.item.name}”`, link: "Check items" },
+      "/invoices": { record: `invoice draft for ${order.customer.name} (${order.item.name})`, link: "Check invoices" },
+    };
+    const { record, link } = records[path];
+    invoice = `<div class="invoice-status"><span class="status-icon">${icon("orders")}</span><div><h3>Check the result in FIZ</h3><span class="small muted">POST ${h(path)} may have saved the ${h(record)}.</span></div></div><p class="hint">Check this record in ${h(company.name || "your FIZ company")} before resetting the order. If the result is unclear, contact support to avoid creating a duplicate.</p><div class="actions"><a class="button secondary" href="${h(new URL(path, config.appUrl).href)}" target="_blank" rel="noreferrer">${h(link)} ${icon("arrow")}</a></div>`;
   } else {
     invoice = `<div class="invoice-status"><span class="status-icon">${icon("orders")}</span><div><h3>${input ? "Draft needs a retry" : "Ready to invoice"}</h3><span class="small muted">${input ? "Retry this order to recover the saved result." : "Create a draft from this order’s customer and service."}</span></div></div>`;
     if (canWrite) {

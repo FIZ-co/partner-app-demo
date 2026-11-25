@@ -28,7 +28,7 @@ async function setup(
     accessToken = "synthetic-access",
     scope = config.scopes,
     lostDraft = false,
-    draftConflict,
+    conflict,
   } = {},
 ) {
   const calls = [];
@@ -68,21 +68,20 @@ async function setup(
           reasons: [{ code: "AT_CREDENTIALS_REQUIRED" }],
         },
       });
+    if (url.pathname === conflict?.path) {
+      const headers = conflict.retryAfter
+        ? { "Retry-After": conflict.retryAfter }
+        : {};
+      conflict = undefined;
+      return Response.json(
+        { message: "Synthetic operation conflict" },
+        { status: 409, headers },
+      );
+    }
     if (url.pathname === "/customers")
       return Response.json({ id: "customer-a" });
     if (url.pathname === "/items") return Response.json({ id: "item-a" });
     if (url.pathname === "/invoices") {
-      if (draftConflict) {
-        const retryAfter = draftConflict === "running" ? "3" : undefined;
-        draftConflict = undefined;
-        return Response.json(
-          { message: "Synthetic operation conflict" },
-          {
-            status: 409,
-            headers: retryAfter ? { "Retry-After": retryAfter } : {},
-          },
-        );
-      }
       if (lostDraft) {
         lostDraft = false;
         throw new Error("Synthetic response lost");
@@ -391,10 +390,15 @@ test("lost draft response keeps the order retryable with the original key and in
   );
 });
 
-for (const outcome of ["running", "abandoned"]) {
-  test(`409 ${outcome} keeps only in-progress orders retryable`, async (t) => {
+for (const [path, record, retryAfter] of [
+  ["/invoices", "invoice draft", "3"],
+  ["/customers", "customer “Alex Morgan”"],
+  ["/items", "service item “Website maintenance”"],
+  ["/invoices", "invoice draft for Alex Morgan"],
+]) {
+  test(`409 on POST ${path} with ${retryAfter ? "pending" : "unknown"} outcome`, async (t) => {
     const { calls, request, connect } = await setup(t, {
-      draftConflict: outcome,
+      conflict: { path, retryAfter },
     });
     await connect();
     const page = await (await request("/company")).text();
@@ -407,7 +411,8 @@ for (const outcome of ["running", "abandoned"]) {
     const response = await post();
     assert.equal(response.status, 400);
     const html = await response.text();
-    if (outcome === "running") {
+    assert.ok(html.includes(`POST ${path} returned HTTP 409`));
+    if (retryAfter) {
       assert.match(html, /Retry draft creation/);
       assert.match(html, /Retry-After: 3/);
       assert.equal((await post()).status, 200);
@@ -416,12 +421,20 @@ for (const outcome of ["running", "abandoned"]) {
         2,
       );
     } else {
-      assert.match(html, /Check the result in FIZ/);
-      assert.doesNotMatch(html, /<form action="\/orders\/1042\/draft"/);
-      assert.equal((await post()).status, 400);
-      assert.equal(
-        calls.filter((call) => call.url.endsWith("/invoices")).length,
-        1,
+      const blocked = await post();
+      assert.equal(blocked.status, 400);
+      for (const view of [html, await (await request("/")).text(), await blocked.text()]) {
+        assert.ok(view.includes(`POST ${path} may have saved the ${record}`));
+        assert.ok(view.includes(`href="${config.appUrl}${path}"`));
+        assert.doesNotMatch(view, /<form action="\/orders\/1042\/draft"/);
+      }
+      const paths = ["/customers", "/items", "/invoices"];
+      const writes = calls.filter(
+        (call) => call.method === "POST" && new URL(call.url).origin === config.api,
+      );
+      assert.deepEqual(
+        writes.map((call) => new URL(call.url).pathname),
+        paths.slice(0, paths.indexOf(path) + 1),
       );
     }
   });

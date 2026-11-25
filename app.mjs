@@ -99,6 +99,7 @@ export function createDemoServer(config, fetchImpl = fetch) {
 
   const server = createServer(async (req, res) => {
     let session = { csrf: "" };
+    let writePath;
     try {
       if (
         req.method !== "GET" &&
@@ -229,9 +230,9 @@ export function createDemoServer(config, fetchImpl = fetch) {
           throw new Error(
             "A write is already in progress. Wait, then retry the same request.",
           );
-        if (session.orderUncertain)
+        if (session.uncertainWritePath)
           throw new Error(
-            "Check the existing FIZ records before starting another operation. The previous result is unknown; contact support if needed.",
+            `The outcome of POST ${session.uncertainWritePath} is unknown. Check the record in FIZ before resetting this order.`,
           );
         session.writing = true;
         try {
@@ -267,9 +268,11 @@ export function createDemoServer(config, fetchImpl = fetch) {
             );
           session.orderInput = input;
           // Persist every successful step. Stable keys also cover a lost HTTP response.
+          writePath = "/customers";
           session.orderCustomer ??= await fiz.customers.create(order.customer, {
             idempotencyKey: `${key}:customer`,
           });
+          writePath = "/items";
           session.orderItem ??= await fiz.items.create(
             {
               ...order.item,
@@ -290,6 +293,7 @@ export function createDemoServer(config, fetchImpl = fetch) {
             customerId: session.orderCustomer.id,
             items: [{ id: session.orderItem.id, quantity: order.quantity }],
           };
+          writePath = "/invoices";
           const result = await fiz.invoices.create(payload, {
             idempotencyKey: `${key}:draft`,
           });
@@ -308,7 +312,7 @@ export function createDemoServer(config, fetchImpl = fetch) {
             error instanceof FizConflictError &&
             !error.headers.get("retry-after")
           )
-            session.orderUncertain = true;
+            session.uncertainWritePath = writePath;
           throw error;
         } finally {
           session.writing = false;
@@ -332,7 +336,7 @@ export function createDemoServer(config, fetchImpl = fetch) {
       render(res, session);
     } catch (error) {
       const message =
-        error instanceof FizApiError ? apiErrorHint(error) : error.message;
+        error instanceof FizApiError ? apiErrorHint(error, writePath) : error.message;
       render(res, session ?? { csrf: "" }, message, 400);
     }
   });
@@ -345,7 +349,7 @@ export function createDemoServer(config, fetchImpl = fetch) {
   return server;
 }
 
-function apiErrorHint(error) {
+function apiErrorHint(error, writePath) {
   const retry = error.headers.get("retry-after");
   const hints = {
     401: "Check expiry, app availability and the token resource. Reconnect if the grant was revoked.",
@@ -358,5 +362,6 @@ function apiErrorHint(error) {
   };
   const hint =
     hints[error.status] ?? "Check the request against the API reference.";
-  return `FIZ returned HTTP ${error.status}. ${hint}${retry ? ` Retry-After: ${retry}.` : ""}`;
+  const operation = writePath ? `POST ${writePath}` : "FIZ";
+  return `${operation} returned HTTP ${error.status}. ${hint}${retry ? ` Retry-After: ${retry}.` : ""}`;
 }
